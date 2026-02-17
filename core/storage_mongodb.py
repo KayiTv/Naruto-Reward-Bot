@@ -99,6 +99,18 @@ class MongoStorage:
             upsert=True
         )
 
+    # --- EVENT STATE (NEW) ---
+
+    def get_event_state(self) -> Dict:
+        """Get event manager state from rewards collection"""
+        return self.rewards.find_one({"_id": "event_state"}) or {}
+
+    def save_event_state(self, state: Dict):
+        """Save event manager state to rewards collection"""
+        state['_id'] = "event_state"
+        state['updated_at'] = int(time.time())
+        self.rewards.replace_one({"_id": "event_state"}, state, upsert=True)
+
     # --- AUDIT & STORAGE (NEW) ---
 
     def add_penalty(self, user_id: int, p_type: str, duration_sec: int, reason: str):
