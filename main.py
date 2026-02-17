@@ -5,6 +5,7 @@ import os
 import sys 
 import json # Added json
 import time
+import subprocess
 from datetime import datetime, timedelta
 
 # Load environment variables
@@ -261,6 +262,35 @@ async def reload_cmd(event):
         
     except Exception as e:
         await msg.edit(f"❌ Error reloading: {e}")
+
+@bot.on(events.NewMessage(pattern=r'^/restart$'))
+async def restart_cmd(event):
+    if event.sender_id != config.get('owner_id', OWNER_ID): return
+    
+    msg = await event.reply("🔄 **Restarting Bot...**")
+    
+    try:
+        # 1. Pull latest code from GitHub
+        await msg.edit("🔄 **Restarting Bot...**\n\n• Checking for updates (git pull)...")
+        try:
+            pull_output = subprocess.check_output(["git", "pull"], stderr=subprocess.STDOUT).decode()
+            update_status = f"✅ Success: `{pull_output[:50]}...`" if "Already up to date" not in pull_output else "✅ Already up to date"
+        except Exception as e:
+            update_status = f"⚠️ Skip: {str(e)[:50]}"
+
+        # 2. Sync DB (reload config)
+        await msg.edit(f"🔄 **Restarting Bot...**\n\n• Updates: {update_status}\n• Syncing Database...")
+        db.get_config()
+        
+        # 3. Final log
+        await logger.log("SYSTEM", "Bot", 0, "Bot Restarting", "Initiated by Owner via /restart")
+        await msg.edit(f"✅ **Restarting now!**\n\nUpdates: {update_status}\nStatus: **Reloading Process...**")
+        
+        # 4. Restart Process
+        os.execl(sys.executable, sys.executable, *sys.argv)
+        
+    except Exception as e:
+        await msg.edit(f"❌ **Restart Failed:** {e}")
 
 
 def encode_data(action, user_id=0):
