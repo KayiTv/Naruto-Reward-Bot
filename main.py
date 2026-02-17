@@ -13,11 +13,8 @@ load_dotenv()
 
 # --- EVENT LOOP FIX FOR CLOUD DEPLOYMENT ---
 # Telethon requires an active loop during initialization in some environments
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 from telethon import TelegramClient, events, functions, types, Button, errors
 from telethon.sessions import StringSession
