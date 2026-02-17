@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telethon import TelegramClient, events, functions, types, Button, errors
+from telethon.sessions import StringSession
 from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.users import GetFullUserRequest
 import random
@@ -174,8 +175,19 @@ try:
     event_manager = EventManager(db)
     
     # Clients
-    bot = TelegramClient('bot', config['api_id'], config['api_hash'])
-    userbot = TelegramClient(config.get('session_name', 'userbot'), config['api_id'], config['api_hash'])
+    bot_session = os.getenv('BOT_STRING_SESSION') or 'bot'
+    userbot_session = os.getenv('STRING_SESSION') or config.get('session_name', 'userbot')
+
+    bot = TelegramClient(
+        StringSession(bot_session) if os.getenv('BOT_STRING_SESSION') else bot_session, 
+        config['api_id'], 
+        config['api_hash']
+    )
+    userbot = TelegramClient(
+        StringSession(userbot_session) if os.getenv('STRING_SESSION') else userbot_session, 
+        config['api_id'], 
+        config['api_hash']
+    )
     
     eligibility_checker = EligibilityChecker(bot, config)
     logger = Logger(bot, config.get('log_channel_id', 0), db=db)
