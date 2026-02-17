@@ -249,13 +249,14 @@ async def reload_cmd(event):
         # Update Components
         spam_detector.update_config(config)
         milestone_manager.config = config
+        event_manager.reload()
         
         # Update Helper Constants (if any depend on config directly)
         global REQUIRED_BOT, REQUIRED_GROUP
         REQUIRED_BOT = config.get('eligibility', {}).get('required_bio_string', "@Naruto_X_Boruto_Bot")
         REQUIRED_GROUP = config.get('eligibility', {}).get('required_groups_map', {}).get('group_main', "@NarutoMainGroup")
         
-        await msg.edit("✅ **Config Reloaded Successfully!**\n\n• Spam Settings updated\n• Milestones updated\n• Admin list updated (in-memory)")
+        await msg.edit("✅ **Config Reloaded Successfully!**\n\n• Spam Settings updated\n• Milestones updated\n• Reward Interval synced\n• Admin list updated (in-memory)")
         await logger.log("ADMIN", event.sender.first_name, event.sender_id, "Reloaded Configuration")
         
     except Exception as e:

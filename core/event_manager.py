@@ -14,9 +14,9 @@ class EventManager:
         self.paused_until = 0
         
         # Load from DB
-        self._load_from_db()
+        self.reload()
     
-    def _load_from_db(self):
+    def reload(self):
         """Load configuration and state from MongoDB"""
         try:
             # 1. Load Config from reward settings
