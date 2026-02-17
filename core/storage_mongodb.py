@@ -33,6 +33,9 @@ class MongoStorage:
         self.anti_spam = self.db['anti_spam']
         self.bot_storage = self.db['bot_storage']
         
+        # Performance Buffers (NEW)
+        self.message_buffer = {} # {user_id: count}
+        
         print("✅ Connected to MongoDB")
     
     # --- CONFIGURATION (NEW) ---
@@ -141,53 +144,89 @@ class MongoStorage:
     # --- USER OPERATIONS ---
     
     def update_user_msg(self, user_id: str):
-        """Increment user message count (global + daily)"""
+        """Increment user message count in memory (buffered)"""
         user_id = str(user_id)
-        now = int(time.time())
-        today = self.get_today_date()
-        
-        # Update user stats
-        self.users.update_one(
-            {"_id": user_id},
-            {
-                "$inc": {"stats.total_msgs": 1},
-                "$set": {"updated_at": now},
-                "$setOnInsert": {
-                    "first_name": "Unknown",
-                    "username": None,
-                    "stats.total_stocks": 0,
-                    "stats.last_win": 0,
-                    "status": {
-                        "is_banned": False,
-                        "is_whitelisted": False,
-                        "is_penalized": False
+        self.message_buffer[user_id] = self.message_buffer.get(user_id, 0) + 1
+
+    def flush_message_buffer(self):
+        """Write all buffered message increments to MongoDB"""
+        if not self.message_buffer:
+            return 0
+            
+        try:
+            now = int(time.time())
+            today = self.get_today_date()
+            count = 0
+            
+            # Using bulk updates for performance
+            from pymongo import UpdateOne
+            bulk_ops = []
+            
+            for user_id, inc in self.message_buffer.items():
+                count += inc
+                # 1. Update User Stats (General)
+                bulk_ops.append(UpdateOne(
+                    {"_id": user_id},
+                    {
+                        "$inc": {"stats.total_msgs": inc},
+                        "$set": {"updated_at": now},
+                        "$setOnInsert": {
+                            "first_name": "Unknown",
+                            "username": None,
+                            "stats.total_stocks": 0,
+                            "stats.last_win": 0,
+                            "status": {
+                                "is_banned": False,
+                                "is_whitelisted": False,
+                                "is_penalized": False
+                            },
+                            "violations": {"count": 0, "last_violation": None, "history": []},
+                            "created_at": now
+                        }
                     },
-                    "violations": {"count": 0, "last_violation": None, "history": []},
-                    "created_at": now
-                }
-            },
-            upsert=True
-        )
-        
-        # Update daily stats (Nested Structure)
-        self.daily_stats.update_one(
-            {"_id": today},
-            {
-                "$inc": {f"stats.{user_id}.messages": 1},
-                "$set": {
-                    f"stats.{user_id}.updated_at": now,
-                    "updated_at": now
-                },
-                "$setOnInsert": {
-                    "created_at": now,
-                    f"stats.{user_id}.stocks_won": 0,
-                    f"stats.{user_id}.wins_count": 0,
-                    f"stats.{user_id}.tier": "Bronze",
-                    f"stats.{user_id}.created_at": now
-                }
-            },
-            upsert=True
-        )
+                    upsert=True
+                ))
+                
+                # 2. Update Daily Stats (Nested Structure)
+                bulk_ops.append(UpdateOne(
+                    {"_id": today},
+                    {
+                        "$inc": {f"stats.{user_id}.messages": inc},
+                        "$set": {
+                            f"stats.{user_id}.updated_at": now,
+                            "updated_at": now
+                        },
+                        "$setOnInsert": {
+                            "created_at": now,
+                            f"stats.{user_id}.stocks_won": 0,
+                            f"stats.{user_id}.wins_count": 0,
+                            f"stats.{user_id}.tier": "Bronze",
+                            f"stats.{user_id}.created_at": now
+                        }
+                    },
+                    upsert=True
+                ))
+            
+            if bulk_ops:
+                # Perform bulk writes
+                self.users.bulk_write([op for op in bulk_ops if list(op._filter.keys())[0] == "_id" and op._filter["_id"] != today])
+                # Daily stats is a separate collection
+                # We need to filter and split them
+                user_ops = [op for op in bulk_ops if "_id" in op._filter and op._filter["_id"] != today]
+                daily_ops = [op for op in bulk_ops if "_id" in op._filter and op._filter["_id"] == today]
+                
+                if user_ops:
+                    self.users.bulk_write(user_ops)
+                if daily_ops:
+                    self.daily_stats.bulk_write(daily_ops)
+                
+            # Clear buffer
+            self.message_buffer = {}
+            return count
+            
+        except Exception as e:
+            print(f"❌ Error Flushing DB Buffer: {e}")
+            return 0
     
     def get_user_rank(self, user_id: int) -> tuple[int, int]:
         """Get user's rank and total users today"""

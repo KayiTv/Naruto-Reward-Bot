@@ -58,14 +58,16 @@ class EventManager:
         except Exception as e:
             print(f"⚠️ EventManager Save Config Error: {e}")
 
-    def _save_state(self):
-        """Save runtime state to rewards collection"""
+    def _save_state(self, force=False):
+        """Save runtime state to rewards collection (buffered)"""
         try:
-            state = {
-                'current_count': self.current_count,
-                'target_count': self.target_count
-            }
-            self.storage.save_event_state(state)
+            # Only save to DB every 10 messages or if forced (on reward)
+            if force or self.current_count % 10 == 0:
+                state = {
+                    'current_count': self.current_count,
+                    'target_count': self.target_count
+                }
+                self.storage.save_event_state(state)
         except Exception as e:
             print(f"⚠️ EventManager Save State Error: {e}")
 
@@ -81,7 +83,7 @@ class EventManager:
         self.target_count = self._generate_random_target()
         self.current_count = 0
         self._save_config()
-        self._save_state()
+        self._save_state(force=True)
     
     def stop_event(self):
         self.active = False
@@ -95,7 +97,7 @@ class EventManager:
         self.target_count = int(count)
         self.current_count = 0
         self._save_config()
-        self._save_state()
+        self._save_state(force=True)
 
     def get_remaining(self):
         if not self.active: return None
@@ -119,7 +121,7 @@ class EventManager:
             
         self.current_count += 1
         
-        # Save progress every message (required for Render survival)
+        # Save progress every message (buffered)
         self._save_state()
         
         if self.current_count >= self.target_count:
@@ -137,7 +139,8 @@ class EventManager:
                     self.target_count = self._generate_random_target()
                 # If fixed, target_count stays same
             
-            self._save_state()
+            # Force save on trigger for consistency
+            self._save_state(force=True)
             return True 
             
         return False

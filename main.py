@@ -214,6 +214,17 @@ except Exception as e:
 
 # --- HELPERS ---
 
+async def db_buffer_flusher():
+    """Background task to flush DB message buffers every 30 seconds"""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            count = db.flush_message_buffer()
+            if count > 0:
+                print(f"✅ [SYSTEM] Flushed DB Buffer: {count} messages saved.")
+        except Exception as e:
+            print(f"⚠️ [ERROR] DB Flush Error: {e}")
+
 def check_admin(user_id):
     # Check DB first (dynamic)
     if db.is_admin(user_id):
@@ -4058,6 +4069,7 @@ async def main():
     
     # Start background tasks
     bot.loop.create_task(update_owner_info(bot))
+    bot.loop.create_task(db_buffer_flusher())
     
     await logger.log("SYSTEM", "Bot", 0, "Bot Started", "Status: Online")
     print("Online.")
