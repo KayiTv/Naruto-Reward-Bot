@@ -857,19 +857,21 @@ class MongoStorage:
 
     def get_recent_winners(self, limit=10) -> List[Dict]:
         """Get recent reward winners"""
-        # Query rewards collection
-        cursor = self.rewards.find().sort("timestamp", -1).limit(limit)
+        # Query rewards collection, exclude settings document
+        cursor = self.rewards.find({"user_id": {"$exists": True}}).sort("timestamp", -1).limit(limit)
         results = []
         for doc in cursor:
             # Fetch name
-            uid = doc['user_id']
+            uid = doc.get('user_id')
+            if not uid: continue
+            
             user = self.users.find_one({"_id": uid})
             name = user.get('first_name', f"User {uid}") if user else f"User {uid}"
             
             results.append({
                 'name': name,
-                'stocks': doc['amount'],
-                'time': doc['timestamp']
+                'stocks': doc.get('amount', 0),
+                'time': doc.get('timestamp', int(time.time()))
             })
         return results
 
