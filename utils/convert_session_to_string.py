@@ -9,17 +9,17 @@ load_dotenv()
 def convert_session(session_name):
     session_file = f"{session_name}.session"
     if not os.path.exists(session_file):
-        print(f"❌ Error: {session_file} not found in current directory.")
+        print(f"ERROR: {session_file} not found in current directory.")
         return
 
     api_id = os.getenv('API_ID')
     api_hash = os.getenv('API_HASH')
 
     if not api_id or not api_hash:
-        print("❌ Error: API_ID and API_HASH must be set in .env")
+        print("ERROR: API_ID and API_HASH must be set in .env")
         return
 
-    print(f"🔄 Converting {session_file}...")
+    print(f"INFO: Converting {session_file}...")
     
     try:
         # Load existing file session
@@ -35,14 +35,14 @@ def convert_session(session_name):
         loop = asyncio.get_event_loop()
         string_session = loop.run_until_complete(get_string())
         
-        print(f"\n✅ SUCCESS! Here is your {session_name} String Session:\n")
+        print(f"\nSUCCESS! Here is your {session_name} String Session:\n")
         print("-" * 50)
         print(string_session)
         print("-" * 50)
         print("\nCopy the long string above and use it as your ENV variable on Render.")
         
     except Exception as e:
-        print(f"❌ Failed to convert: {e}")
+        print(f"ERROR: Failed to convert: {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
