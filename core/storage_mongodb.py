@@ -50,7 +50,6 @@ class MongoStorage:
         
         # Phase 4: Write-Behind Queue
         self.write_queue = WriteQueue(self.db, flush_interval=5)
-        self.write_queue.start()
         
         print("✅ Connected to MongoDB (Async/Motor + WriteQueue)")
     

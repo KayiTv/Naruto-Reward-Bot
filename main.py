@@ -4016,6 +4016,10 @@ async def main():
     print("Starting Web Server...")
     start_server()
     print("Bot Starting...")
+    
+    # Start background database queue (Phase 7 fix)
+    db.write_queue.start()
+    
     await bot.start(bot_token=config['bot_token'])
     print("Userbot Starting...")
     await userbot.start(phone=config['phone_number'])
