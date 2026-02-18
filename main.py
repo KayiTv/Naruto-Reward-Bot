@@ -3220,7 +3220,7 @@ async def help_cb(event):
 
 async def group_handler(event):
     # Strict Filtering: Exclude bots and userbots
-    if event.is_private or not event.sender or event.sender.bot:
+    if event.is_private or not event.sender or getattr(event.sender, 'bot', False):
         return
         
     # Exclude service messages (Join, Leave, Pin, etc.)
@@ -4047,6 +4047,6 @@ async def main():
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         pass

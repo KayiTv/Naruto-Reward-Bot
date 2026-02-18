@@ -25,7 +25,7 @@ class Logger:
         
         # Log to DB
         if self.db:
-            self.db.log_action(admin_id, f"CONFIG: {event}", details)
+            await self.db.log_action(admin_id, f"CONFIG: {event}", details)
 
     async def log(self, event_type: str, user_name: str, user_id: int, details: str = "", extra: str = ""):
         timestamp = datetime.now(IST_TZ).strftime("%H:%M IST")
@@ -60,7 +60,7 @@ class Logger:
         
         # Log to DB
         if self.db:
-            self.db.log_action(user_id, f"EVENT: {event_type}", f"{details} | {extra}")
+            await self.db.log_action(user_id, f"EVENT: {event_type}", f"{details} | {extra}")
 
     async def _send(self, message: str):
         try:
