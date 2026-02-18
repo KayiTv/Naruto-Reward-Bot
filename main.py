@@ -1590,7 +1590,7 @@ async def close_cb(event):
     await event.delete()
 
 
-def save_reward_config(new_conf):
+async def save_reward_config(new_conf):
     config['reward_settings'] = new_conf
     await save_config(config)
 
