@@ -3506,12 +3506,12 @@ async def db_ping(event):
     try:
         # Measure ping time
         start = time.time()
-        db.db.client.server_info()  # Force connection check
+        await db.db.client.server_info()  # Force connection check
         latency = (time.time() - start) * 1000  # Convert to ms
         
         # Get database stats
-        stats = db.db.client.admin.command('ping')
-        server_status = db.db.client.admin.command('serverStatus')
+        stats = await db.db.client.admin.command('ping')
+        server_status = await db.db.client.admin.command('serverStatus')
         
         # Connection info
         connections = server_status.get('connections', {})
@@ -3551,26 +3551,26 @@ async def db_stats(event):
     
     try:
         # Collection counts
-        users_count = db.users.count_documents({})
-        daily_stats_count = db.daily_stats.count_documents({})
-        rewards_count = db.rewards.count_documents({})
-        penalties_count = db.penalties.count_documents({})
+        users_count = await db.users.count_documents({})
+        daily_stats_count = await db.daily_stats.count_documents({})
+        rewards_count = await db.rewards.count_documents({})
+        penalties_count = await db.penalties.count_documents({})
         
         # Active penalties
         active_penalties = await db.get_all_penalties()
         
         # Banned users
-        banned_count = db.users.count_documents({"status.is_banned": True})
+        banned_count = await db.users.count_documents({"status.is_banned": True})
         
         # Whitelisted users
-        whitelisted_count = db.users.count_documents({"status.is_whitelisted": True})
+        whitelisted_count = await db.users.count_documents({"status.is_whitelisted": True})
         
         # Today's activity
         today = db.get_today_date()
-        today_stats = db.daily_stats.count_documents({"date": today})
+        today_stats = await db.daily_stats.count_documents({"date": today})
         
         # Database size
-        stats = db.db.command("dbStats")
+        stats = await db.db.command("dbStats")
         db_size = stats.get('dataSize', 0) / (1024 * 1024)  # MB
         storage_size = stats.get('storageSize', 0) / (1024 * 1024)  # MB
         
@@ -3640,7 +3640,7 @@ async def dbview_users_callback(event):
     await event.edit("⏳ Loading users...")
     
     # Get top 10 users by messages
-    users = list(db.users.find().sort("stats.total_msgs", -1).limit(10))
+    users = await db.users.find().sort("stats.total_msgs", -1).limit(10).to_list(length=10)
     
     if not users:
         return await event.edit("📭 No users found")
@@ -3683,7 +3683,7 @@ async def dbview_daily_callback(event):
     
     # Get top today
     today = db.get_today_date()
-    stats = list(db.daily_stats.find({"date": today}).sort("messages", -1).limit(10))
+    stats = await db.daily_stats.find({"date": today}).sort("messages", -1).limit(10).to_list(length=10)
     
     if not stats:
         return await event.edit("📭 No activity today")
@@ -3708,7 +3708,7 @@ async def dbview_rewards_callback(event):
     await event.edit("⏳ Loading rewards...")
     
     # Get last 10 rewards
-    rewards = list(db.rewards.find().sort("timestamp", -1).limit(10))
+    rewards = await db.rewards.find().sort("timestamp", -1).limit(10).to_list(length=10)
     
     if not rewards:
         return await event.edit("📭 No rewards yet")
@@ -3816,13 +3816,13 @@ async def db_search(event):
     
     try:
         # Search by exact ID
-        user = db.users.find_one({"_id": query})
+        user = await db.users.find_one({"_id": query})
         
         if not user:
             # Search by partial ID
-            users = list(db.users.find({
+            users = await db.users.find({
                 "_id": {"$regex": f"^{query}"}
-            }).limit(5))
+            }).limit(5).to_list(length=5)
             
             if not users:
                 return await status_msg.edit("❌ No users found")
