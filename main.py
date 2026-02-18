@@ -1141,7 +1141,7 @@ async def set_reward_cmd(event):
         return
 
     # Helper to save and log
-    def save():
+    async def save():
         config['reward_settings'] = conf
         await save_config(config)
 
@@ -1171,7 +1171,7 @@ async def set_reward_cmd(event):
             val_str = f"{val}"
             details = f"Example Rewards:\n• Bronze user: {val} stocks\n• Silver user: {int(val*1.5)} stocks (1.5x)"
             
-        save()
+        await save()
         
         # Frame 2
         tiers_enabled = conf.get('tiers', {}).get('enabled', False)
@@ -1206,7 +1206,7 @@ Previous: {old_val} ({old_mode})"""
         msg = await event.reply("⚙️ Toggling tier system...")
         
         conf.setdefault('tiers', {})['enabled'] = state
-        save()
+        await save()
         
         if state:
             text = f"""✅ **Tier system enabled!**
@@ -1249,7 +1249,7 @@ No activity-based multipliers."""
                 old_range_str = f"{old_range[0]}-{old_range[1]}"
                 
                 conf.setdefault('tiers', {}).setdefault(tier, {})['range'] = [mn, mx]
-                save()
+                await save()
                 
                 text = f"""✅ **Tier range updated!**
 
@@ -1393,7 +1393,7 @@ async def setspam_cmd(event):
     args = event.pattern_match.group(1)
     
     # Load settings
-    spam_settings = db.get_anti_spam_settings()
+    spam_settings = await db.get_anti_spam_settings()
     
     if not args or args.lower() == 'show':
         text = get_spam_settings_menu(spam_settings)
@@ -1429,7 +1429,7 @@ async def setspam_cmd(event):
         spam_settings[key] = val
         
         # Save to DB
-        db.save_anti_spam_settings(spam_settings)
+        await db.save_anti_spam_settings(spam_settings)
         
         # Update in-memory for immediate effect
         config['spam_settings'] = spam_settings
