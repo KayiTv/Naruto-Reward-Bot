@@ -32,7 +32,10 @@ from core.logger import Logger
 from core.milestones import MilestoneManager
 from core.web_server import start_server
 
-# --- CONFIGURATION ---
+# Phase 2 & 6 Monitoring/Utility Imports
+from core.cache import user_cache, config_cache
+from utils.db_monitor import get_performance_report, check_performance
+
 # --- CONFIGURATION & DATABASE ---
 
 try:
@@ -41,24 +44,19 @@ except Exception as e:
     print(f"[ERROR] Database Connection Error: {e}")
     sys.exit(1)
 
-# Load config from DB
-config = db.get_config()
+# Load config from DB (Async-to-Sync Bridge for startup)
+config = loop.run_until_complete(db.get_config())
 
 # If empty, try to migrate or set defaults
 if not config:
-    print("[WARN] No config found in DB. Please run 'migrate_config.py' first!")
-    # For fail-safety, we might want to check for local file and migrate automatically?
-    # But user asked to move everything. Let's assume migration script ran.
-    # We can try to load local just to migrate it on fly?
+    print("[WARN] No config found in DB. Checking local config.json...")
     if os.path.exists('config.json'):
-        print("[INFO] Found local config.json, migrating...")
-        try:
-           import migrate_config
-           migrate_config.migrate()
-           config = db.get_config()
-        except Exception as e:
-             print(f"[ERROR] Auto-migration failed: {e}")
-             sys.exit(1)
+         with open('config.json', 'r') as f:
+             local_config = json.load(f)
+             db_sync = MongoStorage() # Re-init if needed
+             loop.run_until_complete(db_sync.save_config(local_config))
+             config = local_config
+             print("[INFO] Migrated local config.json to MongoDB.")
     else:
         print("[ERROR] No config found. Exiting.")
         sys.exit(1)
@@ -66,32 +64,18 @@ if not config:
 
 # Hydrate config from environment variables if missing
 if config:
-    if not config.get('api_id') and os.getenv('API_ID'):
-        try:
-            config['api_id'] = int(os.getenv('API_ID'))
-        except:
-            config['api_id'] = os.getenv('API_ID') # fallback
-            
-    if not config.get('api_hash') and os.getenv('API_HASH'):
-        config['api_hash'] = os.getenv('API_HASH')
-        
-    if not config.get('bot_token') and os.getenv('BOT_TOKEN'):
-        config['bot_token'] = os.getenv('BOT_TOKEN')
-        
-    if not config.get('owner_id') and os.getenv('OWNER_ID'):
-        try:
-            config['owner_id'] = int(os.getenv('OWNER_ID'))
-        except:
-             pass
+    for key in ['api_id', 'owner_id', 'log_channel_id']:
+        val = config.get(key) or os.getenv(key.upper())
+        if val:
+            try:
+                config[key] = int(val)
+            except:
+                config[key] = val
 
-    if not config.get('phone_number') and os.getenv('PHONE_NUMBER'):
-        config['phone_number'] = os.getenv('PHONE_NUMBER')
-
-    if not config.get('log_channel_id') and os.getenv('LOG_CHANNEL_ID'):
-        try:
-            config['log_channel_id'] = int(os.getenv('LOG_CHANNEL_ID'))
-        except:
-             pass
+    for key in ['api_hash', 'bot_token', 'phone_number']:
+        val = config.get(key) or os.getenv(key.upper())
+        if val:
+            config[key] = val
 
 OWNER_ID = config.get('owner_id')
 LOG_CHANNEL_ID = config.get('log_channel_id')
@@ -118,14 +102,13 @@ async def edit_with_delay(msg, new_text, delay=0.5):
     await asyncio.sleep(delay)
     await msg.edit(new_text)
 
-def save_config(new_config):
-    # Save main bot config
-    db.save_config(new_config)
-    # Also save separate modules if present
+async def save_config(new_config):
+    """Save config to all collections async"""
+    await db.save_config(new_config)
     if 'reward_settings' in new_config:
-        db.save_reward_settings(new_config['reward_settings'])
+        await db.save_reward_settings(new_config['reward_settings'])
     if 'spam_settings' in new_config:
-        db.save_anti_spam_settings(new_config['spam_settings'])
+        await db.save_anti_spam_settings(new_config['spam_settings'])
 
 def validate_config():
     required = ['api_id', 'api_hash', 'bot_token', 'phone_number']
@@ -199,10 +182,10 @@ try:
     logger = Logger(bot, config.get('log_channel_id', 0), db=db)
 
     # Milestone Manager
-    def save_config_callback(new_conf):
+    async def save_config_callback(new_conf):
         global config
         config = new_conf
-        save_config(config)
+        await db.save_config(config)
     milestone_manager = MilestoneManager(config, save_config_callback)
 
 except Exception as e:
@@ -214,39 +197,28 @@ except Exception as e:
 
 # --- HELPERS ---
 
-async def db_buffer_flusher():
-    """Background task to flush DB message buffers every 30 seconds"""
-    while True:
-        try:
-            await asyncio.sleep(30)
-            count = db.flush_message_buffer()
-            if count > 0:
-                print(f"✅ [SYSTEM] Flushed DB Buffer: {count} messages saved.")
-        except Exception as e:
-            print(f"⚠️ [ERROR] DB Flush Error: {e}")
+# db_buffer_flusher removed in favor of Phase 4 WriteQueue
 
-def check_admin(user_id):
-    # Check DB first (dynamic)
-    if db.is_admin(user_id):
+async def check_admin(user_id):
+    """Check if user is admin (Cached)"""
+    # 1. Check DB/Cache first (Phase 2/5)
+    if await db.is_admin(user_id):
         return True
         
-    # Check config (static)
+    # 2. Check config
     admin_ids = config.get('admin_ids', [])
     owner_id = config.get('owner_id')
-    if not owner_id: return False # No owner set
-    
-    str_ids = [str(a) for a in admin_ids]
-    return user_id == owner_id or user_id in admin_ids or str(user_id) in str_ids
+    return user_id == owner_id or user_id in admin_ids or str(user_id) in [str(a) for a in admin_ids]
 
 @bot.on(events.NewMessage(pattern=r'^/reload$'))
 async def reload_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     msg = await event.reply("🔄 Reloading config from DB...")
     
     try:
         global config
-        new_config = db.get_config()
+        new_config = await db.get_config()
         if not new_config:
             await msg.edit("❌ Failed to fetch config from DB.")
             return
@@ -255,8 +227,8 @@ async def reload_cmd(event):
         config = new_config
         
         # Reload modules from separated locations
-        config['reward_settings'] = db.get_reward_settings()
-        config['spam_settings'] = db.get_anti_spam_settings()
+        config['reward_settings'] = await db.get_reward_settings()
+        config['spam_settings'] = await db.get_anti_spam_settings()
         
         # Update Components
         spam_detector.update_config(config)
@@ -291,7 +263,7 @@ async def restart_cmd(event):
 
         # 2. Sync DB (reload config)
         await msg.edit(f"🔄 **Restarting Bot...**\n\n• Updates: {update_status}\n• Syncing Database...")
-        db.get_config()
+        await db.get_config()
         
         # 3. Final log
         await logger.log("SYSTEM", "Bot", 0, "Bot Restarting", "Initiated by Owner via /restart")
@@ -310,19 +282,18 @@ def encode_data(action, user_id=0):
 def get_mention(user):
     return f"[{user.first_name}](tg://user?id={user.id})"
 
-def get_tier_details(user_id):
-    # Determine user's tier based on daily messages
-    daily_stats = db.get_daily_stats(user_id)
+async def get_tier_details(user_id):
+    """Determine user tier (Async + Cached)"""
+    # Phase 2: db.get_daily_stats is already cached
+    daily_stats = await db.get_daily_stats(user_id)
     daily_msgs = daily_stats['msgs']
     
     reward_conf = config.get('reward_settings', {})
     tiers = reward_conf.get('tiers', {})
     
     if not tiers.get('enabled', False):
-        return None, 1.0, daily_msgs, None, 0 # Tier system disabled
+        return None, 1.0, daily_msgs, None, 0
         
-    # Dynamic Tier Logic
-    # 1. Collect all valid tiers
     tier_list = []
     for name, data in tiers.items():
         if name == 'enabled' or not isinstance(data, dict): continue
@@ -333,37 +304,25 @@ def get_tier_details(user_id):
                 'max': data['range'][1],
                 'multiplier': data.get('multiplier', 1.0)
             })
-            
-    # 2. Sort by minimum requirement
+    
     tier_list.sort(key=lambda x: x['min'])
     
-    current_tier = "Bronze" # Default if nothing matches (shouldn't happen with 0 min)
+    current_tier = "Bronze"
     multiplier = 1.0
     next_tier = None
     msgs_needed = 0
     
-    # 3. Find current tier
     for i, t in enumerate(tier_list):
         if t['min'] <= daily_msgs <= t['max']:
             current_tier = t['name']
             multiplier = t['multiplier']
-            
-            # Find next tier
             if i + 1 < len(tier_list):
                 next_t = tier_list[i+1]
                 next_tier = next_t['name']
                 msgs_needed = max(0, next_t['min'] - daily_msgs)
-            else:
-                next_tier = None # Max tier
-                msgs_needed = 0
             break
             
-    # Fallback for > Max (Legend case usually covers this if max is high enough)
-    # If daily_msgs > last tier max, stay on last tier
-    if not tier_list:
-        return current_tier, multiplier, daily_msgs, next_tier, msgs_needed
-        
-    if daily_msgs > tier_list[-1]['max']:
+    if tier_list and daily_msgs > tier_list[-1]['max']:
         current_tier = tier_list[-1]['name']
         multiplier = tier_list[-1]['multiplier']
         next_tier = None
@@ -371,63 +330,33 @@ def get_tier_details(user_id):
 
     return current_tier, multiplier, daily_msgs, next_tier, msgs_needed
 
-def calculate_reward(user_id):
+async def calculate_reward(user_id):
+    """Calculate reward amount (Async)"""
     reward_conf = config.get('reward_settings', {})
-    
-    # Milestone Bonus
     ms_bonus = milestone_manager.get_active_bonus()
-    ms_multi = ms_bonus['multiplier']
-    ms_chance = ms_bonus['jackpot_chance']
-    ms_active = ms_bonus['active']
+    tier_name, multiplier, daily_msgs, _, _ = await get_tier_details(user_id)
 
-    # 3. Tier Multiplier
-    tier_name, multiplier, daily_msgs, _, _ = get_tier_details(user_id)
-
-    # 1. Jackpot Check
+    # Jackpot Check
     jackpot = reward_conf.get('jackpot', {})
     if jackpot.get('enabled', False):
-        # Event overrides jackpot chance
-        chance = ms_chance if ms_active else jackpot.get('chance', 0)
-        
+        chance = ms_bonus['jackpot_chance'] if ms_bonus['active'] else jackpot.get('chance', 0)
         if random.randint(1, 100) <= chance:
             return {
-                'type': 'jackpot',
-                'amount': jackpot['amount'],
-                'base': 0,
-                'multiplier': 1.0,
-                'tier': tier_name,
-                'tier_multiplier': multiplier,
-                'heading_extra': " (EVENT ACTIVE!)" if ms_active else "",
-                'msg': f"🎰 **JACKPOT HIT!** 🎰{f' (Event Chance: {chance}%)' if ms_active else ''}"
+                'type': 'jackpot', 'amount': jackpot['amount'], 'base': 0,
+                'multiplier': 1.0, 'tier': tier_name, 'tier_multiplier': multiplier,
+                'heading_extra': " (EVENT ACTIVE!)" if ms_bonus['active'] else "",
+                'msg': f"🎰 **JACKPOT HIT!** 🎰"
             }
             
-    # 2. Base Amount
+    # Base Amount
     base = reward_conf.get('base', {})
-    if base.get('mode') == 'random':
-        try:
-             mn = base.get('min', 5)
-             mx = base.get('max', 10)
-             amount = random.randint(mn, mx)
-        except:
-             amount = 5
-    else:
-        amount = base.get('amount', 5)
-        
-    # Calculate Final: Base * Tier Multi * Milestone Multi
-    final_amount = int(amount * multiplier * ms_multi)
-    
-    msg_extra = ""
-    if ms_active:
-        msg_extra = f"\n🔥 **Event Bonus:** {ms_multi}x Applied!"
+    amount = random.randint(base.get('min', 5), base.get('max', 10)) if base.get('mode') == 'random' else base.get('amount', 5)
+    final_amount = int(amount * multiplier * ms_bonus['multiplier'])
     
     return {
-        'type': 'normal',
-        'amount': final_amount,
-        'base': amount,
-        'multiplier': multiplier,
-        'ms_multiplier': ms_multi,
-        'tier': tier_name,
-        'msg': f"Reward{msg_extra}"
+        'type': 'normal', 'amount': final_amount, 'base': amount,
+        'multiplier': multiplier, 'ms_multiplier': ms_bonus['multiplier'],
+        'tier': tier_name, 'msg': f"Reward{' (Event Bonus!)' if ms_bonus['active'] else ''}"
     }
 
 def get_settings_menu(user_id):
@@ -462,8 +391,8 @@ def get_settings_menu(user_id):
     ]
     return text, buttons
 
-def get_menu_layout(user_id):
-    is_admin = check_admin(user_id)
+async def get_menu_layout(user_id):
+    is_admin = await check_admin(user_id)
     
     # Buttons
     buttons = [
@@ -504,7 +433,7 @@ def encode_data(action, user_id):
 
 @bot.on(events.NewMessage(pattern=r'^/setlimit (burst|flood) (\d+) (\d+)$'))
 async def setlimit_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     limit_type = event.pattern_match.group(1).lower()
     count = int(event.pattern_match.group(2))
@@ -533,7 +462,7 @@ async def setlimit_cmd(event):
     s[conf_key_limit] = count
     s[conf_key_window] = seconds
     config['spam_settings'] = s
-    save_config(config)
+    await save_config(config)
     spam_detector.update_config(config)
     
     # Frame 2
@@ -580,7 +509,7 @@ async def start_cmd(event):
     sender = await event.get_sender()
     uid = sender.id
     
-    text, buttons = get_menu_layout(uid)
+    text, buttons = await get_menu_layout(uid)
     await event.reply(text, buttons=buttons)
 
 @bot.on(events.NewMessage(pattern=r'^/eligible$'))
@@ -588,8 +517,9 @@ async def eligible_cmd(event):
     uid = event.sender_id
     
     # Admin checking another user
-    if event.is_reply and check_admin(uid):
+    if event.is_reply and await check_admin(uid):
         reply = await event.get_reply_message()
+        if not reply: return
         target_uid = reply.sender_id
         user_entity = reply.sender
         name = user_entity.first_name if user_entity else str(target_uid)
@@ -598,7 +528,7 @@ async def eligible_cmd(event):
         await asyncio.sleep(1.5)
         
         res = await eligibility_checker.check_user(target_uid)
-        stats = db.get_user_stats(target_uid)
+        stats = await db.get_user_stats(target_uid)
         is_eligible = (res is True)
         
         # Report
@@ -643,9 +573,9 @@ User: [{name}](tg://user?id={target_uid}) (`{target_uid}`)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 **USER STATS**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Messages today: {db.get_daily_stats(target_uid)['msgs']}
+Messages today: {(await db.get_daily_stats(target_uid))['msgs']}
 Total messages: {stats['total_msgs']}
-Stocks won today: {db.get_daily_stats(target_uid)['stocks']}
+Stocks won today: {(await db.get_daily_stats(target_uid))['stocks']}
 Total stocks won: {stats['total_stocks']}
 """
         if stats['last_win'] > 0:
@@ -698,7 +628,7 @@ async def mytier_cmd(event):
     msg = await event.reply("📊 Checking your tier...")
     await asyncio.sleep(0.5)
     
-    tier_name, multiplier, msgs, next_tier, needed = get_tier_details(uid)
+    tier_name, multiplier, msgs, next_tier, needed = await get_tier_details(uid)
     
     if not tier_name:
         await msg.edit("⚠️ Tier system is currently disabled.")
@@ -746,7 +676,7 @@ async def top_cmd(event):
     admin_view = False
     
     if args and (args.lower() == 'details' or args.lower() == 'admin'):
-        if not check_admin(event.sender_id):
+        if not await check_admin(event.sender_id):
             await event.reply("❌ Admin only.")
             return
         admin_view = True
@@ -755,7 +685,7 @@ async def top_cmd(event):
     msg = await event.reply("🏆 Loading leaderboard...")
     # Delay implied by fetching
     
-    top_users = db.get_top_daily(10)
+    top_users = await db.get_top_daily(event.chat_id, limit=10)
     now_str = db.get_ist_now().strftime("%H:%M IST")
     
     if not top_users:
@@ -790,9 +720,9 @@ Be the first to chat and win rewards!
             
         if admin_view:
             # Admin View: ID, Tier, Wins
-            tier_name, _, _, _, _ = get_tier_details(int(uid))
+            tier_name, _, _, _, _ = await get_tier_details(int(uid))
             tier_icon = {'Bronze': '🥉', 'Silver': '🥈', 'Gold': '🥇', 'Platinum': '💎'}.get(tier_name, '')
-            stats = db.get_user_stats(uid)
+            stats = await db.get_user_stats(uid)
             last_win = "Never"
             if stats['last_win']:
                 # Calculate time ago roughly
@@ -814,17 +744,17 @@ Be the first to chat and win rewards!
     text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     
     if not admin_view and not user_rank_in_top:
-        rank, total = db.get_user_rank(event.sender_id)
+        rank, total = await db.get_user_rank(event.sender_id, event.chat_id)
         if rank:
-            daily = db.get_daily_stats(event.sender_id)
+            daily = await db.get_daily_stats(event.sender_id, event.chat_id)
             text += f"Your rank: #{rank}\nYour messages: {daily['msgs']} msgs | {daily['stocks']} stocks\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
     if admin_view:
         # Extra stats footer
-        all_stats = db.get_all_daily_stats()
+        all_stats = await db.get_all_daily_stats(event.chat_id)
         total_active_users = len(all_stats)
-        # Calculate sums
-        daily_stocks_sum = sum(u['stocks'] for u in all_stats.values() if isinstance(u, dict))
+        # Calculate sums (all_stats is a list of dicts)
+        daily_stocks_sum = sum(u.get('stocks', 0) for u in all_stats)
         
         text += f"Total active: {total_active_users} users\nTotal stocks won: {daily_stocks_sum} stocks\n"
 
@@ -880,29 +810,26 @@ Use /eligible to check your status
 Managed by [{OWNER_FIRST_NAME}](tg://user?id={OWNER_ID})"""
     await event.reply(text)
 
-@bot.on(events.NewMessage(pattern=r'^/stats$'))
-async def stats_cmd(event):
+@bot.on(events.NewMessage(pattern=r'^/botstats$'))
+async def botstats_cmd(event):
     # Restricted to Admin
-    if not check_admin(event.sender_id):
+    if not await check_admin(event.sender_id):
         await event.reply("❌ **Access Denied.** This command is for admins only.")
         return
         
     msg = await event.reply("📊 Loading statistics...")
     await asyncio.sleep(1.0)
     
-    global_stats = db.get_global_stats()
+    global_stats = await db.get_global_stats()
     
     # Calculate daily (sum of all daily stats for today)
-    # This is expensive if many users, but fine for now
-    today = time.strftime("%Y-%m-%d")
-    # Calculate daily (sum of all daily stats for today)
-    daily_map = db.get_all_daily_stats()
-    day_msgs = sum(u['msgs'] for u in daily_map.values())
-    day_stocks = sum(u['stocks'] for u in daily_map.values())
-    active_users = len(daily_map)
+    daily_stats = await db.get_all_daily_stats() # Returns List[Dict]
+    day_msgs = sum(u.get('msgs', 0) for u in daily_stats)
+    day_stocks = sum(u.get('stocks', 0) for u in daily_stats)
+    active_users = len(daily_stats)
     
-    # Calculate rewards count from global? Or just sum stocks
-    # "Rewards given" - we track total_selections in global
+    # Get active penalties
+    ap = await db.get_all_penalties()
     
     text = f"""📊 **Bot Statistics**
 
@@ -932,7 +859,7 @@ Cooldown: **None** ✨
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Status: {"✅ Active" if config.get('antispam_enabled', True) else "❌ Disabled"}
 Blocked today: ?
-Active penalties: {len(db.get_all_penalties())}
+Active penalties: {len(ap)}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 **ALL TIME**
@@ -942,14 +869,16 @@ Total stocks: {global_stats['distributed_stocks']}
 Total users: {global_stats['total_tracked_users']}
 
 Managed by [{OWNER_FIRST_NAME}](tg://user?id={config.get('owner_id')})"""
+
     await msg.edit(text)
+
 
 
 # --- ADMIN COMMANDS ---
 
 @bot.on(events.NewMessage(pattern=r'^/admins$'))
 async def admins_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     admin_ids = config.get('admin_ids', [])
     owner_id = config.get('owner_id', OWNER_ID)
@@ -972,7 +901,7 @@ async def admins_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/addadmin(?: (\d+|@\w+))?$'))
 async def add_admin_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     # Check if user is owner (only owner can add admins?) 
     # Request doesn't specify, but usually only owner. 
@@ -993,7 +922,7 @@ async def add_admin_cmd(event):
     uid = user.id
     if uid not in config.get('admin_ids', []):
         config.setdefault('admin_ids', []).append(uid)
-        save_config(config)
+        await save_config(config)
         
         msg = await event.reply("⏳ Adding admin...")
         await asyncio.sleep(0.5)
@@ -1012,7 +941,7 @@ Use /admins to view all."""
 
 @bot.on(events.NewMessage(pattern=r'^/thappad(?: (\d+|@\w+))?$'))
 async def thappad_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     user = None
     if event.is_reply:
@@ -1032,7 +961,7 @@ async def thappad_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/maafi(?: (\d+|@\w+))?$'))
 async def maafi_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     user = None
     if event.is_reply:
@@ -1052,9 +981,9 @@ async def maafi_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/banned$'))
 async def banned_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
-    banned = db.get_banned_users()
+    banned = await db.get_banned_users()
     if not banned:
         await event.reply("📜 **No one is banned.** (Yet...)")
         return
@@ -1066,7 +995,7 @@ async def banned_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/rmadmin(?: (\d+|@\w+))?$'))
 async def rmadmin_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     user = None
     if event.is_reply:
@@ -1083,7 +1012,7 @@ async def rmadmin_cmd(event):
     uid = user.id
     if uid in config.get('admin_ids', []):
         config['admin_ids'].remove(uid)
-        save_config(config)
+        await save_config(config)
         
         msg = await event.reply("⏳ Removing admin...")
         await asyncio.sleep(0.5)
@@ -1101,7 +1030,7 @@ Remaining admins: {len(config['admin_ids'])}"""
 
 @bot.on(events.NewMessage(pattern=r'^/setinterval (\d+)(?:[ -](\d+))?$'))
 async def set_interval_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     min_val = int(event.pattern_match.group(1))
     max_val = event.pattern_match.group(2)
@@ -1127,7 +1056,7 @@ Count: {min_val} messages"""
 
 @bot.on(events.NewMessage(pattern=r'^/next$'))
 async def next_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     remaining = event_manager.get_remaining()
     if remaining is None:
@@ -1149,7 +1078,7 @@ async def next_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/tierinfo$'))
 async def tierinfo_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     conf = config.get('reward_settings', {})
     tiers = conf.get('tiers', {})
@@ -1198,7 +1127,7 @@ Rewards calculated from base again.""")
 
 @bot.on(events.NewMessage(pattern=r'^/setreward(?: (.+))?$'))
 async def set_reward_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     args = event.pattern_match.group(1)
     conf = config.get('reward_settings', {})
@@ -1214,7 +1143,7 @@ async def set_reward_cmd(event):
     # Helper to save and log
     def save():
         config['reward_settings'] = conf
-        save_config(config)
+        await save_config(config)
 
     # Sub-commands
     parts = args.split()
@@ -1339,7 +1268,7 @@ More users can now reach {tier.title()} tier!"""
                 
                 conf.setdefault('tiers', {}).setdefault(tier, {})['multiplier'] = mult
                 config['reward_settings'] = conf # Keep global config and sub-conf synced
-                save_config(config)
+                await save_config(config)
                 
                 text = f"""✅ **{tier.title()} Multiplier Updated**
 
@@ -1368,7 +1297,7 @@ Multiplier: {old_mult}x → {mult}x"""
                 
                 conf.setdefault('tiers', {}).setdefault(tier, {})['range'] = [min_v, max_v]
                 config['reward_settings'] = conf # Keep global config and sub-conf synced
-                save_config(config)
+                await save_config(config)
                 
                 text = f"""✅ **{tier.title()} Tier Updated**
 
@@ -1382,7 +1311,7 @@ Range: {old_range} → [{min_v}, {max_v}]"""
 
 @bot.on(events.NewMessage(pattern=r'^/settier(?: (.+))?$'))
 async def settier_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     args = event.pattern_match.group(1)
     if not args:
@@ -1448,7 +1377,7 @@ async def settier_cmd(event):
         r_settings['tiers'] = tiers_conf
         config['reward_settings'] = r_settings
         
-        save_config(config)
+        await save_config(config)
         text = f"✅ **{tier.title()} Updated**\n\n" + "\n".join(items_updated)
         await msg.edit(text)
         await logger.log_config(f"{tier.title()} Tier Update", "\n".join(items_updated), event.sender.first_name, event.sender_id)
@@ -1459,7 +1388,7 @@ async def settier_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/setspam(?: (.+))?$'))
 async def setspam_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     args = event.pattern_match.group(1)
     
@@ -1663,7 +1592,7 @@ async def close_cb(event):
 
 def save_reward_config(new_conf):
     config['reward_settings'] = new_conf
-    save_config(config)
+    await save_config(config)
 
 def get_reward_settings_text(conf):
     base = conf['base']
@@ -1723,7 +1652,7 @@ Template: `{conf['command_template']}`"""
 
 @bot.on(events.NewMessage(pattern=r'^/whitelist (\d+|@\w+)$'))
 async def whitelist_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     try:
         user = await bot.get_entity(event.pattern_match.group(1))
@@ -1735,7 +1664,7 @@ async def whitelist_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/rmwhitelist (\d+|@\w+)$'))
 async def rmwhitelist_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     try:
         user = await bot.get_entity(event.pattern_match.group(1))
@@ -1747,9 +1676,9 @@ async def rmwhitelist_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/wlist$'))
 async def wlist_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
-    wlist = db.get_whitelisted_users()
+    wlist = await db.get_whitelisted_users()
     if not wlist:
         await event.reply("📜 **Whitelist is empty.**")
         return
@@ -1761,13 +1690,13 @@ async def wlist_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/antispam (on|off)$'))
 async def antispam_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     action = event.pattern_match.group(1).lower()
     enabled = (action == "on")
     
     config['antispam_enabled'] = enabled
-    save_config(config)
+    await save_config(config)
     spam_detector.toggle(enabled)
     
     # Send Frame 1
@@ -1807,7 +1736,7 @@ Users can send unlimited messages.
 
 @bot.on(events.NewMessage(pattern=r'^/spamtypes (enable|disable|list) ?(\w+)?$'))
 async def spamtypes_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     action = event.pattern_match.group(1).lower()
     stype = event.pattern_match.group(2)
@@ -1831,7 +1760,7 @@ async def spamtypes_cmd(event):
     if 'types' not in s: s['types'] = {}
     s['types'][stype] = new_state
     config['spam_settings'] = s
-    save_config(config)
+    await save_config(config)
     
     msg = await event.reply("⚙️ Updating spam detection...")
     await asyncio.sleep(0.5)
@@ -1858,7 +1787,7 @@ def get_type_desc(t):
 
 @bot.on(events.NewMessage(pattern=r'^/spamconfig (\w+) (\w+) (.+)$'))
 async def spamconfig_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     stype = event.pattern_match.group(1).lower()
     setting = event.pattern_match.group(2).lower()
@@ -1893,7 +1822,7 @@ async def spamconfig_cmd(event):
         
     s[config_key] = new_val
     config['spam_settings'] = s
-    save_config(config)
+    await save_config(config)
     spam_detector.update_config(config)
     
     msg = await event.reply("⚙️ Updating configure...")
@@ -1910,7 +1839,7 @@ New: {new_val}"""
 
 @bot.on(events.NewMessage(pattern=r'^/setlimit (burst|flood) (\d+) (\d+)$'))
 async def setlimit_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     limit_type = event.pattern_match.group(1).lower()
     count = int(event.pattern_match.group(2))
@@ -1956,7 +1885,7 @@ Applies to ALL users combined."""
         log_text = f"Changed: Flood limit\nOld: {old_c} msgs / {old_s}s\nNew: {count} msgs / {seconds}s"
     
     config['spam_settings'] = s
-    save_config(config)
+    await save_config(config)
     spam_detector.update_config(config)
     
     await msg.edit(text)
@@ -1964,7 +1893,7 @@ Applies to ALL users combined."""
 
 @bot.on(events.NewMessage(pattern=r'^/setpenalty (global )?(\d+)$'))
 async def setpenalty_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     is_global = event.pattern_match.group(1) == "global "
     value = int(event.pattern_match.group(2))
@@ -2000,7 +1929,7 @@ Spam violators will be ignored for {value} minutes."""
         log_text = f"Changed: Penalty duration\nOld: {old} minutes\nNew: {value} minutes"
     
     config['spam_settings'] = s
-    save_config(config)
+    await save_config(config)
     spam_detector.update_config(config)
     
     await msg.edit(text)
@@ -2008,7 +1937,7 @@ Spam violators will be ignored for {value} minutes."""
 
 @bot.on(events.NewMessage(pattern=r'^/resetviolations (?:@?(\w+)|(\d+))?$'))
 async def resetviolations_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     # Handle reply
     input_arg = event.pattern_match.group(1) or event.pattern_match.group(2)
@@ -2032,8 +1961,8 @@ async def resetviolations_cmd(event):
     msg = await event.reply("⏳ Resetting violations...")
     await asyncio.sleep(0.5)
     
-    prev_violations = db.get_violation_level(str(user_id))
-    db.reset_violations(str(user_id))
+    prev_violations = await db.get_violation_level_v2(user_id)
+    await db.reset_violations_v2(user_id)
     
     # Use user object for name if available, else ID
     name = get_mention(user) if user else f"`{user_id}`"
@@ -2052,7 +1981,7 @@ Current penalty (if active) unchecked."""
 
 @bot.on(events.NewMessage(pattern=r'^/clear (?:@?(\w+)|(\d+))?$'))
 async def clear_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
 
     input_arg = event.pattern_match.group(1) or event.pattern_match.group(2)
     user_id = None
@@ -2072,7 +2001,7 @@ async def clear_cmd(event):
         await event.reply("❌ Reply to a user or provide username/ID.")
         return
 
-    db.remove_penalty(str(user_id))
+    await db.remove_penalty_v2(user_id)
     spam_detector.reset_history(str(user_id)) # Also clear memory
     
     name = get_mention(user) if user else f"`{user_id}`"
@@ -2081,7 +2010,7 @@ async def clear_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/(addadmin|rmadmin)(?: (?:@?(\w+)|(\d+)))?$'))
 async def admin_mgmt_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     cmd = event.pattern_match.group(1).lower()
     input_arg = event.pattern_match.group(2) or event.pattern_match.group(3)
@@ -2121,7 +2050,7 @@ async def admin_mgmt_cmd(event):
         if db.is_admin(user_id):
             await event.reply("⚠️ Already an admin.")
             return
-        db.add_admin(user_id)
+        await db.add_admin(user_id)
         await event.reply(f"✅ **Admin Added:** `{user_id}`")
         await logger.log("ADMIN", event.sender.first_name, event.sender_id, f"Added admin {user_id}")
         
@@ -2129,13 +2058,13 @@ async def admin_mgmt_cmd(event):
         if not db.is_admin(user_id):
             await event.reply("⚠️ Not an admin.")
             return
-        db.remove_admin(user_id)
+        await db.remove_admin(user_id)
         await event.reply(f"🗑️ **Admin Removed:** `{user_id}`")
         await logger.log("ADMIN", event.sender.first_name, event.sender_id, f"Removed admin {user_id}")
 
 @bot.on(events.NewMessage(pattern=r'^/penalty (?:@?(\w+)|(\d+))(?:\s+(\d+))?$'))
 async def penalty_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     args = event.pattern_match.group(1) or event.pattern_match.group(2)
     duration = event.pattern_match.group(3)
@@ -2160,7 +2089,7 @@ async def penalty_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/unpenalty (?:@?(\w+)|(\d+))$'))
 async def unpenalty_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     args = event.pattern_match.group(1) or event.pattern_match.group(2)
     try:
@@ -2176,7 +2105,7 @@ async def unpenalty_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/unpause$'))
 async def unpause_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     event_manager.unpause()
     spam_detector.reset_global()
@@ -2186,7 +2115,7 @@ async def unpause_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/adminhelp$'))
 async def admin_help_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     text = """🛡️ **Admin Commands**
 
@@ -2215,11 +2144,11 @@ async def admin_help_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/logs(?: (\d+))?$'))
 async def logs_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     count = int(event.pattern_match.group(1) or 10)
     if count > 50: count = 50
     
-    logs = db.get_logs(count)
+    logs = await db.get_logs(count)
     if not logs:
         await event.reply("📜 No logs available.")
         return
@@ -2237,7 +2166,7 @@ async def logs_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/announce (.+)$'))
 async def announce_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     msg = event.pattern_match.group(1)
     
     group_id = config.get('target_group_id')
@@ -2298,32 +2227,28 @@ async def restore_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/cooldowns$'))
 async def cooldowns_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
-    penalties = db.get_all_penalties()
+    penalties = await db.get_all_penalties()
     if not penalties:
         await event.reply("✅ **No active penalties.**")
         return
         
     text = f"🛑 **Active Penalties ({len(penalties)})**\n\n"
     now = time.time()
-    for uid, data in penalties.items():
+    for data in penalties:
+        uid = data['user_id']
         remaining = int((data['expiry'] - now) / 60)
         level = data.get('level', 1)
-        try:
-             # Try to get name if cached or fetch? Fetching might be slow for many.
-             # Just show ID for speed, or basic link.
-             text += f"• [{uid}](tg://user?id={uid}) (L{level}): {remaining}m remaining\n"
-        except:
-             text += f"• `{uid}` (L{level}): {remaining}m remaining\n"
+        text += f"• [{uid}](tg://user?id={uid}) (L{level}): {remaining}m remaining\n"
              
     await event.reply(text)
 
 @bot.on(events.NewMessage(pattern=r'^/recent$'))
 async def recent_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
-    recent = db.get_recent_winners()
+    recent = await db.get_recent_winners()
     if not recent:
         await event.reply("📜 **No recent winners.**")
         return
@@ -2350,11 +2275,12 @@ async def recent_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/usage$'))
 async def usage_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     # Simple stats for now
-    total = db.get_global_stats()['total_selections']
-    distributed = db.get_global_stats()['distributed_stocks']
+    stats = await db.get_global_stats()
+    total = stats['total_selections']
+    distributed = stats['distributed_stocks']
     
     text = f"""📊 **Usage Statistics**
     
@@ -2420,15 +2346,15 @@ async def resolve_amount_and_user(event):
 
 @bot.on(events.NewMessage(pattern=r'^/add(?:\s+(.+))?$'))
 async def add_stock_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     amount, user, err = await resolve_amount_and_user(event)
     if err:
         await event.reply(err)
         return
         
-    db.add_user_stock(user.id, amount)
-    stats = db.get_user_stats(user.id)
+    await db.add_user_stock(user.id, event.chat_id, amount)
+    stats = await db.get_user_stats(user.id, event.chat_id)
     name = user.first_name if hasattr(user, 'first_name') and user.first_name else 'User'
     
     await event.reply(f"✅ Added **{amount}** stocks to [{name}](tg://user?id={user.id}).\nNew Balance: {stats['total_stocks']}")
@@ -2436,15 +2362,15 @@ async def add_stock_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/remove(?:\s+(.+))?$'))
 async def remove_stock_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     amount, user, err = await resolve_amount_and_user(event)
     if err:
         await event.reply(err)
         return
         
-    db.add_user_stock(user.id, -amount)
-    stats = db.get_user_stats(user.id)
+    await db.add_user_stock(user.id, event.chat_id, -amount)
+    stats = await db.get_user_stats(user.id, event.chat_id)
     name = user.first_name if hasattr(user, 'first_name') and user.first_name else 'User'
     
     await event.reply(f"✅ Removed **{amount}** stocks from [{name}](tg://user?id={user.id}).\nNew Balance: {stats['total_stocks']}")
@@ -2452,15 +2378,15 @@ async def remove_stock_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/addmsg(?:\s+(.+))?$'))
 async def add_msg_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     amount, user, err = await resolve_amount_and_user(event)
     if err:
         await event.reply(err)
         return
 
-    db.add_user_message(user.id, amount)
-    stats = db.get_user_stats(user.id)
+    await db.add_user_message(user.id, amount, event.chat_id)
+    stats = await db.get_user_stats(user.id, event.chat_id)
     name = user.first_name if hasattr(user, 'first_name') and user.first_name else 'User'
     
     await event.reply(f"✅ Added **{amount}** messages to [{name}](tg://user?id={user.id}).\nNew Total: {stats['total_msgs']}")
@@ -2468,19 +2394,47 @@ async def add_msg_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/removemsg(?:\s+(.+))?$'))
 async def remove_msg_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     amount, user, err = await resolve_amount_and_user(event)
     if err:
         await event.reply(err)
         return
 
-    db.add_user_message(user.id, -amount)
-    stats = db.get_user_stats(user.id)
+    await db.add_user_message(user.id, -amount, event.chat_id)
+    stats = await db.get_user_stats(user.id, event.chat_id)
     name = user.first_name if hasattr(user, 'first_name') and user.first_name else 'User'
     
     await event.reply(f"✅ Removed **{amount}** messages from [{name}](tg://user?id={user.id}).\nNew Total: {stats['total_msgs']}")
     await logger.log("ADMIN", event.sender.first_name, event.sender_id, f"Removed {amount} msgs from {user.id}")
+
+@bot.on(events.NewMessage(pattern=r'^/botstats$'))
+async def botstats_cmd(event):
+    if not await check_admin(event.sender_id): return
+    
+    # 1. Global Stats
+    global_stats = await db.get_global_stats()
+    
+    # 2. Daily Stats
+    daily_stats_list = await db.get_all_daily_stats(0) # 0 for all
+    total_today = sum(d['msgs'] for d in daily_stats_list)
+    
+    text = f"""📊 **Bot Performance Stats**
+    
+**Global Activity:**
+• Total Selections: `{global_stats['total_selections']}`
+• Cumulative Reward: `{global_stats['distributed_stocks']}`
+• Tracked Users: `{global_stats['total_tracked_users']}`
+
+**Today's Activity:**
+• Total Messages: `{total_today}`
+• Active Winners: `{len(daily_stats_list)}`
+
+**System Status:**
+• DB Engine: `Motor/MongoDB (Async)`
+• Queue Status: `Active (Phase 4)`
+"""
+    await event.reply(text)
 
 @bot.on(events.NewMessage(pattern=r'^/stats$'))
 async def stats_cmd(event):
@@ -2495,8 +2449,8 @@ async def stats_cmd(event):
          target_id = user_id
          target_name = event.sender.first_name
          
-    stats = db.get_user_stats(target_id)
-    daily = db.get_daily_stats(target_id)
+    stats = await db.get_user_stats(target_id, event.chat_id)
+    daily = await db.get_daily_stats(target_id, event.chat_id)
     
     text = f"""📊 **User Statistics**
 
@@ -2517,13 +2471,20 @@ Keep going! 🚀"""
 
 @bot.on(events.NewMessage(pattern=r'^/clearall$'))
 async def clearall_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
-    count = db.clear_all_penalties()
+    count = await db.clear_all_penalties()
     spam_detector.ignored_users.clear() # Clear memory cache too
     
     await event.reply(f"✅ **All Restrictions Lifted**\n\nCleared {count} penalties.")
     await logger.log("ADMIN", event.sender.first_name, event.sender_id, f"Cleared ALL ({count} users)")
+
+@bot.on(events.NewMessage(pattern=r'^/perf$'))
+async def perf_cmd(event):
+    if not await check_admin(event.sender_id): return
+    msg = await event.reply("📡 **Checking Database Performance...**")
+    report = await get_performance_report(db)
+    await msg.edit(report)
 
 # --- CALLBACK HANDLER ---
 
@@ -2608,13 +2569,13 @@ Fix these issues to qualify!"""
             status += f" ({is_eligible})"
             
         # Check for penalty/cooldown
-        penalty = db.get_penalty(user.id)
+        penalty = await db.get_penalty_v2(user.id, event.chat_id)
         if penalty:
             remaining = int((penalty['expiry'] - time.time()) / 60)
             status = f"🚫 **Restricted** ({remaining}m remaining)"
             
         # Get stats
-        stats = db.get_user_stats(user.id)
+        stats = await db.get_user_stats(user.id, event.chat_id)
         
         text = f"""🔍 **Eligibility Report**
         
@@ -2630,8 +2591,8 @@ Fix these issues to qualify!"""
         await event.edit(text, buttons=buttons)
         
     elif action == "stats":
-        stats = db.get_user_stats(user_id)
-        daily = db.get_daily_stats(user_id)
+        stats = await db.get_user_stats(user_id, event.chat_id)
+        daily = await db.get_daily_stats(user_id, event.chat_id)
         text = f"""📊 **Your Statistics**
 
 👤 **{event.sender.first_name}**
@@ -2657,7 +2618,7 @@ Keep going! 🚀"""
         target_uid = user_id # View my own top context or just top. 
         # Action 'top' is just refreshing the top list.
         
-        top_users = db.get_top_daily(10)
+        top_users = await db.get_top_daily(event.chat_id, limit=10)
         now_str = db.get_ist_now().strftime("%H:%M IST")
         
         if not top_users:
@@ -2694,8 +2655,8 @@ Be the first to chat and win rewards!
             
             # Check user rank if not in top 10
             if not user_rank_in_top:
-                rank, total = db.get_user_rank(user_id)
-                daily = db.get_daily_stats(user_id)
+                rank, total = await db.get_user_rank(user_id, event.chat_id)
+                daily = await db.get_daily_stats(user_id, event.chat_id)
                 if rank:
                     text += f"Your rank: #{rank}\nYour messages: {daily['msgs']} msgs | {daily['stocks']} stocks\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             
@@ -2711,10 +2672,10 @@ Be the first to chat and win rewards!
         # Personal stats view
         await event.answer("📊 Loading stats...")
         
-        daily = db.get_daily_stats(user_id)
-        current_stats = db.get_user_stats(user_str) # Global stats
+        daily = await db.get_daily_stats(user_id, event.chat_id)
+        current_stats = await db.get_user_stats(user_id, event.chat_id) # Global stats
         
-        tier, multiplier, _, next_tier, msgs_needed = get_tier_details(user_id)
+        tier, multiplier, _, next_tier, msgs_needed = await get_tier_details(user_id)
         
         text = f"""📊 **YOUR STATISTICS**
         
@@ -2755,11 +2716,11 @@ Don't spam, behave!"""
         await event.edit(text, buttons=buttons)
         
     elif action == "menu":
-        text, buttons = get_menu_layout(user_id)
+        text, buttons = await get_menu_layout(user_id)
         await event.edit(text, buttons=buttons)
         
     elif action == "admin_menu":
-        if not check_admin(user_id):
+        if not await check_admin(user_id):
             await event.answer("❌ Admin only", alert=True)
             return
             
@@ -2772,7 +2733,7 @@ Don't spam, behave!"""
         await event.edit(text, buttons=buttons)
         
     elif action == "settings":
-        if not check_admin(user_id): return
+        if not await check_admin(user_id): return
         text, buttons = get_settings_menu(user_id)
         await event.edit(text, buttons=buttons)
         
@@ -2782,7 +2743,7 @@ Don't spam, behave!"""
         curr = config.get('antispam_enabled', True)
         new_state = not curr
         config['antispam_enabled'] = new_state
-        save_config(config)
+        await save_config(config)
         spam_detector.toggle(new_state)
         
         await event.answer(f"Anti-Spam {'Enabled' if new_state else 'Disabled'}")
@@ -2790,21 +2751,22 @@ Don't spam, behave!"""
         await event.edit(text, buttons=buttons)
         
     elif action == "botstats":
-         if not check_admin(user_id): return
-         g = db.get_global_stats()
+         if not await check_admin(user_id): return
+         g = await db.get_global_stats()
+         ap = await db.get_all_penalties()
          text = f"""📊 **Quick Stats**
          
 Users: {g['total_tracked_users']}
 Rewards: {g['total_selections']}
 Stocks: {g['distributed_stocks']}
-Penalties: {len(db.get_all_penalties())}"""
+Penalties: {len(ap)}"""
          buttons = [[Button.inline("⬅️ Back", encode_data("admin_menu", user_id))]]
          await event.edit(text, buttons=buttons)
 
 # --- MILESTONE COMMANDS ---
 @bot.on(events.NewMessage(pattern=r'^/milestone(?: (check|status))?$'))
 async def milestone_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     msg = await event.reply("🔄 Checking milestones...")
     
@@ -2854,7 +2816,7 @@ Active Event: {"✅ YES" if active['active'] else "❌ NO"}
 
 @bot.on(events.NewMessage(pattern=r'^/tierstats$'))
 async def tierstats_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     msg = await event.reply("📊 Calculating tier stats...")
     
@@ -2863,7 +2825,7 @@ async def tierstats_cmd(event):
     stats = {} # "Gold": 10
     total_users = 0
     
-    today_active = db.get_all_daily_stats()
+    today_active = await db.get_all_daily_stats()
     
     if not today_active:
         await msg.edit("📊 **Tier Stats (Today)**\n\nNo active users today yet.")
@@ -2915,7 +2877,7 @@ async def tierstats_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/tier (.*)$'))
 async def tier_check_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     input_str = event.pattern_match.group(1).strip()
     user = None
@@ -2946,7 +2908,7 @@ async def tier_check_cmd(event):
              return
 
     # Get details
-    tier, multiplier, msgs, next_tier, needed = get_tier_details(user.id)
+    tier, multiplier, msgs, next_tier, needed = await get_tier_details(user.id)
     
     text = f"""👤 **User:** [{user.first_name}](tg://user?id={user.id})
 📊 **Messages Today:** {msgs}
@@ -2963,7 +2925,7 @@ async def tier_check_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/setmilestone (\d+)$'))
 async def setmilestone_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     # Debug command to simulate member count
     sim_count = int(event.pattern_match.group(1))
@@ -3005,7 +2967,7 @@ HELP_CATEGORIES = {
 
 @bot.on(events.NewMessage(pattern=r'^/(?:help|adminhelp)(?: (.+))?$'))
 async def admin_help_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     args = event.pattern_match.group(1)
     
@@ -3266,40 +3228,42 @@ async def group_handler(event):
         return
         
     user_id = event.sender_id
-    user_str = str(user_id)
+    group_id = event.chat_id
     
-    # Exclude Owner/Self (Userbot) - explicit check just in case owner is running it
-    # But usually owner should be counted? User request says: "Userbot messages (/add stocks) ... commands sent by admins/bots"
-    # "Commands sent by admins" -> Admin commands like /add stocks should NOT count.
-    # Regular text by admins should count? "Regular user text messages".
-    # Let's count admins for leaderboard, but exclude commands.
-    
-    if event.text.startswith('/'):
-        return
+    # Pre-calculate media status
+    is_media = bool(event.media or event.sticker or event.gif or event.photo or event.video)
 
-    # --- MILESTONE CHECK ---
-    # Disabled by user request (manual check only via /milestone)
-    pass
+    # --- Phase 3 & 5: Parallel Async Parallelization ---
+    # We fetch user data (cached) and run spam detection (async) concurrently.
+    user_data, spam_result = await asyncio.gather(
+        db.get_user(user_id, group_id),
+        spam_detector.is_spam(user_id, event.text, is_media=is_media)
+    )
+    
+    # Extract status from user_data (Zero DB overhead if cached)
+    status = user_data.get('status', {}) if user_data else {}
+    is_whitelisted = status.get('is_whitelisted', False)
+    is_banned = status.get('is_banned', False)
+    is_penalized = status.get('is_penalized', False)
+    penalty_expires = status.get('penalty_expires', 0)
 
     # 0. Global Pause Check
     if event_manager.is_paused():
         return
 
-    # 1. Whitelist Check (Bypass Spam)
-    is_whitelisted = db.is_whitelisted(user_str)
+    # 1. Banned Check
+    if is_banned:
+        return
+        
+    # 2. Penalty Check
+    if is_penalized:
+        if penalty_expires < time.time():
+             # Auto-clear expired penalty (Phase 5)
+             await db.remove_penalty_v2(user_id, group_id)
+        else:
+             return # User is penalized
     
-    # 2. Check Penalty/Ban BEFORE Counting
-    if db.is_banned(user_str): return
-    
-    penalty = db.get_penalty(user_str)
-    if penalty: return # User is restricted, do not count message
-    
-    # 3. Spam Check & Escalation (ALL MESSAGES: Text, Media, Stickers, Commands)
-    # Check for media/sticker/gif
-    is_media = bool(event.media or event.sticker or event.gif or event.photo or event.video)
-    
-    # is_spam(user_id, text, is_media=False, is_whitelisted=False)
-    spam_result = spam_detector.is_spam(user_str, event.text, is_media=is_media, is_whitelisted=is_whitelisted)
+    # 3. Spam Check Processing (Already computed above)
     
     spam_type = spam_result
     spam_details = "Spam detected"
@@ -3324,16 +3288,12 @@ async def group_handler(event):
         return
 
     elif spam_type:
-        # Check if already penalized/banned
-        is_already_ignored = db.is_banned(user_str) or spam_detector.is_ignored(user_str)
-        
-        if spam_type is True or is_already_ignored:
-             # Already ignored (spam_check memory). 
+        # Check if already ignored (Phase 2: Cached)
+        if spam_type is True or await spam_detector.is_ignored(user_id):
              return
 
-        # Calculate Penalty
-        # 1. Increment Violation
-        level = db.add_violation(user_str)
+        # 1. Increment Violation (Async)
+        level = await db.add_violation(user_id, group_id)
         
         # 2. Determine Duration (Stacking)
         if level == 1:
@@ -3342,12 +3302,7 @@ async def group_handler(event):
             duration = 90
         elif level == 3:
             duration = 180
-        elif level == 4:
-            duration = 360
-        else:
-            duration = 720
-            
-        level, duration = db.add_penalty(user_str, duration, reason=f"{spam_type} spam")
+        level, duration = await db.add_penalty_v2(user_id, group_id, duration, reason=f"{spam_type} spam")
         
         # Log Spam
         status = "ESCALATED" if level > 1 else "PENALIZED"
@@ -3387,8 +3342,8 @@ async def group_handler(event):
         
         return
 
-    # 3. Ignore Check (If not spamming now, but still under penalty)
-    if db.is_banned(user_str) or spam_detector.is_ignored(user_str):
+    # 3. Final Restriction Check (Redundant but safe)
+    if is_banned or is_penalized:
         return
 
     # 4. Command Cooldown Check (Commands Only)
@@ -3413,12 +3368,11 @@ async def group_handler(event):
     if is_media:
         return
 
-    # 6. Valid Message for Reward
-    # 6. Valid Message for Reward
-    db.update_user_msg(user_str)
+    # 6. Valid Message for Reward (Phase 4: Bulk Write-Behind)
+    await db.add_user_message_bulk(user_id, group_id)
     
     # 7. Event Loop (Trigger Reward)
-    if event_manager.process_message():
+    if await event_manager.process_message():
         # Winner Selected!
         sender = await event.get_sender()
         
@@ -3429,16 +3383,16 @@ async def group_handler(event):
             # EXECUTE REWARD
             user_msg = await event.reply(f"🎉 **WINNER** {get_mention(sender)}!\n\nSending reward...")
             
-            # 1. Calculate Reward
-            reward_data = calculate_reward(user_id)
+            # 1. Calculate Reward (Async)
+            reward_data = await calculate_reward(user_id)
             amount = reward_data['amount']
             
-            # 2. Update DB
-            db.add_user_stock(user_str, amount)
-            db.increment_total_selections()
-            
-            # 3. Recent Winner
-            db.add_recent_winner(user_id, sender.first_name, amount)
+            # 2. Update DB (Phase 4: Bulk Operation)
+            await asyncio.gather(
+                db.add_user_stock(user_id, group_id, amount),
+                db.increment_total_selections(),
+                db.add_recent_winner(user_id, sender.first_name, amount)
+            )
             
             # 3. Userbot Action
             # Default to old template if not set in new structure
@@ -3504,7 +3458,7 @@ async def group_handler(event):
 
 @bot.on(events.NewMessage(pattern=r'^/stopevent$'))
 async def stopevent_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     if not event_manager.active:
         await event.reply("✅ Reward events are already **STOPPED**.")
@@ -3515,7 +3469,7 @@ async def stopevent_cmd(event):
 
 @bot.on(events.NewMessage(pattern=r'^/startevent$'))
 async def startevent_cmd(event):
-    if not check_admin(event.sender_id): return
+    if not await check_admin(event.sender_id): return
     
     if event_manager.active:
         await event.reply("✅ Reward events are already **RUNNING**.")
@@ -3603,7 +3557,7 @@ async def db_stats(event):
         penalties_count = db.penalties.count_documents({})
         
         # Active penalties
-        active_penalties = db.get_all_penalties()
+        active_penalties = await db.get_all_penalties()
         
         # Banned users
         banned_count = db.users.count_documents({"status.is_banned": True})
@@ -3785,7 +3739,7 @@ async def dbview_config_callback(event):
     
     await event.edit("⏳ Loading config...")
     
-    config = db.get_config()
+    config = await db.get_config()
     
     reward_settings = config.get('reward_settings', {})
     base = reward_settings.get('base', {})
@@ -3902,7 +3856,7 @@ async def show_user_details(msg, user):
     
     # Get daily stats
     today = db.get_today_date()
-    daily = db.daily_stats.find_one({"date": today, "user_id": user_id})
+    daily = await db.daily_stats.find_one({"date": today, "user_id": user_id})
     
     message = f"""👤 **USER DETAILS**
 
@@ -3947,11 +3901,11 @@ async def show_user_details(msg, user):
 @bot.on(events.CallbackQuery(pattern=rb'^dbuser_(.+)$'))
 async def dbuser_callback(event):
     """Show user details from button"""
-    if event.sender_id != OWNER_ID and not db.is_admin(event.sender_id):
+    if event.sender_id != OWNER_ID and not await db.is_admin(event.sender_id):
         return await event.answer("❌ Admin only", alert=True)
     
     user_id = event.pattern_match.group(1).decode()
-    user = db.users.find_one({"_id": user_id})
+    user = await db.users.find_one({"_id": user_id})
     
     if not user:
         return await event.answer("❌ User not found", alert=True)
@@ -3999,7 +3953,7 @@ async def dbban_callback(event):
         return await event.answer("❌ Owner only", alert=True)
     
     user_id = event.pattern_match.group(1).decode()
-    user = db.users.find_one({"_id": user_id})
+    user = await db.users.find_one({"_id": user_id})
     
     if not user:
         return await event.answer("❌ User not found", alert=True)
@@ -4007,14 +3961,14 @@ async def dbban_callback(event):
     is_banned = user.get('status', {}).get('is_banned', False)
     
     if is_banned:
-        db.unban_user(user_id)
+        await db.unban_user(user_id)
         await event.answer("✅ User unbanned", alert=True)
     else:
-        db.ban_user(user_id, "Manual ban", "Admin")
+        await db.ban_user(user_id, "Manual ban", "Admin")
         await event.answer("✅ User banned", alert=True)
     
     # Refresh display
-    await show_user_details(event, db.users.find_one({"_id": user_id}))
+    await show_user_details(event, await db.users.find_one({"_id": user_id}))
 
 @bot.on(events.CallbackQuery(pattern=rb'^dbwhite_(.+)$'))
 async def dbwhite_callback(event):
@@ -4023,7 +3977,7 @@ async def dbwhite_callback(event):
         return await event.answer("❌ Owner only", alert=True)
     
     user_id = event.pattern_match.group(1).decode()
-    user = db.users.find_one({"_id": user_id})
+    user = await db.users.find_one({"_id": user_id})
     
     if not user:
         return await event.answer("❌ User not found", alert=True)
@@ -4031,14 +3985,14 @@ async def dbwhite_callback(event):
     is_whitelisted = user.get('status', {}).get('is_whitelisted', False)
     
     if is_whitelisted:
-        db.unwhitelist_user(user_id)
+        await db.unwhitelist_user(user_id)
         await event.answer("✅ Removed from whitelist", alert=True)
     else:
-        db.whitelist_user(user_id)
+        await db.whitelist_user(user_id)
         await event.answer("✅ Added to whitelist", alert=True)
     
     # Refresh display
-    await show_user_details(event, db.users.find_one({"_id": user_id}))
+    await show_user_details(event, await db.users.find_one({"_id": user_id}))
 
 # ============================================
 # PERFORMANCE OPTIMIZATION
@@ -4049,10 +4003,10 @@ async def optimize_database():
     """Create indexes for better query performance"""
     try:
         # These indexes improve query speed significantly
-        db.users.create_index([("stats.total_msgs", -1)])
-        db.users.create_index([("status.is_banned", 1)])
-        db.daily_stats.create_index([("date", 1), ("messages", -1)])
-        db.rewards.create_index([("timestamp", -1)])
+        await db.users.create_index([("stats.total_msgs", -1)])
+        await db.users.create_index([("status.is_banned", 1)])
+        await db.daily_stats.create_index([("date", 1), ("messages", -1)])
+        await db.rewards.create_index([("timestamp", -1)])
         
         print("✅ Database indexes optimized")
     except Exception as e:
@@ -4069,7 +4023,7 @@ async def main():
     
     # Start background tasks
     bot.loop.create_task(update_owner_info(bot))
-    bot.loop.create_task(db_buffer_flusher())
+    # db_buffer_flusher removed in Phase 5
     
     await logger.log("SYSTEM", "Bot", 0, "Bot Started", "Status: Online")
     print("Online.")

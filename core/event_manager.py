@@ -1,5 +1,7 @@
+
 import time
 import random
+import logging
 
 class EventManager:
     def __init__(self, storage):
@@ -12,15 +14,12 @@ class EventManager:
         self.active = True 
         self.loop = True   
         self.paused_until = 0
-        
-        # Load from DB
-        self.reload()
-    
-    def reload(self):
-        """Load configuration and state from MongoDB"""
+
+    async def reload(self):
+        """Load configuration and state from MongoDB (Async)"""
         try:
             # 1. Load Config from reward settings
-            reward_settings = self.storage.get_reward_settings()
+            reward_settings = await self.storage.get_reward_settings()
             interval_config = reward_settings.get('interval', {})
             
             if interval_config:
@@ -31,7 +30,7 @@ class EventManager:
                 self.active = interval_config.get('active', True)
             
             # 2. Load Runtime State
-            state = self.storage.get_event_state()
+            state = await self.storage.get_event_state()
             if state:
                 self.current_count = state.get('current_count', 0)
                 self.target_count = state.get('target_count', 0)
@@ -41,12 +40,12 @@ class EventManager:
                 self.target_count = self._generate_random_target() if self.mode == "random" else self.min_target
                 
         except Exception as e:
-            print(f"⚠️ EventManager Load Error: {e}")
+            logging.error(f"⚠️ EventManager Load Error: {e}")
 
-    def _save_config(self):
-        """Save configuration to reward settings"""
+    async def _save_config(self):
+        """Save configuration to reward settings (Async)"""
         try:
-            reward_settings = self.storage.get_reward_settings()
+            reward_settings = await self.storage.get_reward_settings()
             reward_settings['interval'] = {
                 'mode': self.mode,
                 'min': self.min_target,
@@ -54,12 +53,12 @@ class EventManager:
                 'loop': self.loop,
                 'active': self.active
             }
-            self.storage.save_reward_settings(reward_settings)
+            await self.storage.save_reward_settings(reward_settings)
         except Exception as e:
-            print(f"⚠️ EventManager Save Config Error: {e}")
+            logging.error(f"⚠️ EventManager Save Config Error: {e}")
 
-    def _save_state(self, force=False):
-        """Save runtime state to rewards collection (buffered)"""
+    async def _save_state(self, force=False):
+        """Save runtime state to rewards collection (Async + Buffered)"""
         try:
             # Only save to DB every 10 messages or if forced (on reward)
             if force or self.current_count % 10 == 0:
@@ -67,14 +66,14 @@ class EventManager:
                     'current_count': self.current_count,
                     'target_count': self.target_count
                 }
-                self.storage.save_event_state(state)
+                await self.storage.save_event_state(state)
         except Exception as e:
-            print(f"⚠️ EventManager Save State Error: {e}")
+            logging.error(f"⚠️ EventManager Save State Error: {e}")
 
     def _generate_random_target(self):
         return random.randint(self.min_target, self.max_target)
 
-    def start_event(self, min_val=50, max_val=200, loop=False):
+    async def start_event(self, min_val=50, max_val=200, loop=False):
         self.active = True
         self.mode = "random"
         self.loop = loop
@@ -82,22 +81,22 @@ class EventManager:
         self.max_target = int(max_val)
         self.target_count = self._generate_random_target()
         self.current_count = 0
-        self._save_config()
-        self._save_state(force=True)
+        await self._save_config()
+        await self._save_state(force=True)
     
-    def stop_event(self):
+    async def stop_event(self):
         self.active = False
         self.loop = False
-        self._save_config()
+        await self._save_config()
     
-    def set_fixed(self, count, loop=False):
+    async def set_fixed(self, count, loop=False):
         self.active = True
         self.mode = "fixed"
         self.loop = loop
         self.target_count = int(count)
         self.current_count = 0
-        self._save_config()
-        self._save_state(force=True)
+        await self._save_config()
+        await self._save_state(force=True)
 
     def get_remaining(self):
         if not self.active: return None
@@ -112,7 +111,7 @@ class EventManager:
     def unpause(self):
         self.paused_until = 0
 
-    def process_message(self):
+    async def process_message(self):
         if not self.active:
             return False
         
@@ -121,8 +120,8 @@ class EventManager:
             
         self.current_count += 1
         
-        # Save progress every message (buffered)
-        self._save_state()
+        # Save progress every message (buffered inside _save_state)
+        await self._save_state()
         
         if self.current_count >= self.target_count:
             # Trigger Event!
@@ -132,7 +131,7 @@ class EventManager:
             
             if not self.loop:
                 self.active = False # Stop if not looping
-                self._save_config()
+                await self._save_config()
             else:
                 # If looping, set next target
                 if self.mode == "random":
@@ -140,7 +139,7 @@ class EventManager:
                 # If fixed, target_count stays same
             
             # Force save on trigger for consistency
-            self._save_state(force=True)
+            await self._save_state(force=True)
             return True 
             
         return False

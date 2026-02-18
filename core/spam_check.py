@@ -43,7 +43,7 @@ class SpamDetector:
             return True
         return False
 
-    def is_spam(self, user_id, text, is_media=False, is_whitelisted=False):
+    async def is_spam(self, user_id, text, is_media=False, is_whitelisted=False):
         if not self.enabled:
             return False
             
