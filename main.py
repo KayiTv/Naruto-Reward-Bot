@@ -137,7 +137,7 @@ try:
     # db initialized above
     
     # Load separate reward settings from rewards collection
-    reward_settings = db.get_reward_settings()
+    reward_settings = loop.run_until_complete(db.get_reward_settings())
     
     # Ensure tiers enabled by default if not set
     if 'tiers' not in reward_settings:
@@ -149,7 +149,7 @@ try:
     config['reward_settings'] = reward_settings
     
     # Load separate anti-spam settings from anti_spam collection
-    spam_settings = db.get_anti_spam_settings()
+    spam_settings = loop.run_until_complete(db.get_anti_spam_settings())
     
     spam_detector = SpamDetector(
         threshold_seconds=spam_settings.get('threshold_seconds', 5),
